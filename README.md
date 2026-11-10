@@ -1,253 +1,222 @@
-# Matrix multiplication kernel lab
+# Matrix multiplication benchmarks
 
-Write and compare our own GEMM kernels against library implementations. CUDA, Apple Metal and ARM NEON are separate experiments, with explicit input precision, FP32 output, independent FP64 references and measured setup/API overhead.
+Custom CUDA, Metal and ARM NEON GEMM kernels compared with library implementations. Kernels support rectangular matrices and partial tiles. All outputs and accumulators are FP32.
 
-![Apple M5 Max device execution](result/mac-m5-max/kernels/runtime.png)
-
-NVIDIA and Apple measurements stay in different directories. They are **not a hardware ranking**: architectures, memory systems and library versions differ.
-
-## Our kernels
+## Implementations
 
 | Backend | Implementation | Input formats |
 | --- | --- | --- |
-| `tiled` | Original CUDA shared-memory baseline; 32×64 output tile, 1024 threads | FP32 |
-| `register` | CUDA 64×64 tile; 4×4 accumulators/thread | FP32 |
-| `warp` | CUDA 64×128 warp-aware tile; 4×8 accumulators/thread, guarded `float4` loads/stores, padded shared A | FP32 |
-| `warp_large` | CUDA 128×128 tile; 8×8 accumulators/thread, K tile 32 | FP32 |
-| `pipeline` | CUDA 128×128 tile; K tile 16, double-buffered PTX `cp.async` loads overlapped with computation | FP32 |
-| `wmma` | CUDA Tensor Core kernel; 128×128 block, eight warps, eight accumulator fragments/warp, masked staging/stores | TF32, FP16, BF16 |
-| `triton` | Autotuned Triton kernel with grouped tile ordering and frozen prepared plans | FP32, TF32, FP16, BF16 |
-| `metal_naive` | Metal scalar baseline: one output/thread | FP32, FP16 |
-| `metal_tiled` | Metal shared/register tiling: 32×32 output, 2×2 accumulators/thread | FP32, FP16 |
-| `metal_simd` | Metal SIMD-group matrix operations: 64×64 block, four SIMD groups, FP32 accumulation | FP32, FP16 |
-| `metal_tensor` | Our Metal 4 shader using MPP TensorOps; 64×64 tile, four SIMD groups, FP32 cooperative destination, direct device-memory access | FP32, FP16, BF16 |
-| `metal_tensor_morton` | Same TensorOps arithmetic with blocked 8×8 Morton tile traversal; small grids use row-major traversal | FP32, FP16, BF16 |
-| `cpu_neon` | ARM64 NEON 4×8 FMA microkernel; 128×128×256 blocking, packed B, persistent context-owned workers | FP32 |
+| `tiled` | CUDA shared-memory tiling, 32×64 output tile | FP32 |
+| `register` | CUDA 64×64 tile, 4×4 accumulators/thread | FP32 |
+| `warp` | CUDA 64×128 tile, 4×8 accumulators/thread, guarded `float4` loads/stores | FP32 |
+| `warp_large` | CUDA 128×128 tile, 8×8 accumulators/thread, K tile 32 | FP32 |
+| `pipeline` | CUDA 128×128 tile, K tile 16, double-buffered PTX `cp.async` | FP32 |
+| `wmma` | CUDA WMMA, 128×128 tile, eight warps/block | TF32, FP16, BF16 |
+| `triton` | Autotuned tiles, warps and pipeline stages; grouped tile ordering | FP32, TF32, FP16, BF16 |
+| `metal_naive` | One output/thread | FP32, FP16 |
+| `metal_tiled` | 32×32 tile, 2×2 accumulators/thread | FP32, FP16 |
+| `metal_simd` | SIMD-group matrix operations, 64×64 tile | FP32, FP16 |
+| `metal_tensor` | Metal 4 MPP TensorOps, 64×64 tile | FP32, FP16, BF16 |
+| `metal_tensor_morton` | TensorOps with blocked 8×8 Morton tile traversal | FP32, FP16, BF16 |
+| `cpu_neon` | ARM64 NEON 4×8 microkernel, 128×128×256 blocking, packed B, persistent workers | FP32 |
 
-`warp` and `warp_large` work on older CUDA devices too. `pipeline`, `wmma`, Triton, TF32 and CUDA BF16 require compute capability 8.0+. The native CUDA wrapper also rejects an older virtual-architecture image before launching an unsupported kernel.
-
-All kernels handle rectangular M×K×N problems and partial tiles. CUDA vector loads fall back to guarded scalar loads for unaligned pointers/tails. WMMA TF32 inputs are explicitly rounded to nearest-even, not left to an implicit hardware conversion.
-
-Metal's SIMD variant uses FP16 matrix operands directly for FP16 inputs, while accumulating into FP32. Full output tiles store directly; edges use one 8×8 scratch fragment per SIMD group. This reduces threadgroup storage to 9 KiB for FP32 or 5 KiB for FP16, rather than staging the entire output tile.
-
-TensorOps are [Metal 4 matrix primitives](https://developer.apple.com/documentation/metal/running-inline-ml-operations-in-a-shader-with-metal-4), not a call to MPS matrix multiplication. Our shader controls tiling, bounds and traversal. `relaxed_precision` is disabled. On M5-family GPUs, these APIs can use the GPU's neural accelerators; this is **not the separate Apple Neural Engine**. Apple's [MPP programming guide](https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf) explains direct device access and cache-local traversal without mandatory shared-memory staging/software pipelines.
+Metal TensorOps use [matrix primitives inside the shader](https://developer.apple.com/documentation/metal/running-inline-ml-operations-in-a-shader-with-metal-4), not MPSMatrixMultiplication or the Apple Neural Engine.
 
 ## Library baselines
 
-| Backend | Library/device | Input formats with FP32 output |
+| Backends | Device | Input formats |
 | --- | --- | --- |
-| `numpy` | CPU BLAS through NumPy | FP32 |
-| `accelerate` | Direct Apple Accelerate SGEMM | FP32 |
-| `torch_cpu` | PyTorch CPU | FP32 |
-| `cublas` | Direct CUDA SGEMM/GemmEx | FP32, TF32, FP16, BF16 |
-| `torch` | PyTorch CUDA | FP32, TF32, FP16, BF16 |
-| `jax` | Optional JAX GPU JIT with explicit dot-algorithm presets | FP32, TF32, FP16, BF16 |
-| `mps` | Native Apple MPSMatrixMultiplication | FP32, FP16 |
-| `torch_mps` | PyTorch MPS | FP32 |
+| `numpy`, `accelerate`, `torch_cpu` | CPU | FP32 |
+| `cublas`, `torch`, `jax` | CUDA | FP32, TF32, FP16, BF16 |
+| `mps` | Metal | FP32, FP16 |
+| `torch_mps` | Metal | FP32 |
 
-**Every output is FP32.** FP16/BF16 mean rounded input storage and FP32 accumulation/output, not a reduced-precision output subsequently cast to FP32. The native MPS baseline accepts FP16 operands with an FP32 result descriptor. MPSMatrixMultiplication rejects BF16 inputs even though the SDK defines that storage type; BF16 is measured through Metal 4 TensorOps instead. PyTorch MPS remains FP32-only here because its CUDA `out_dtype=float32` mixed-input path is not used for MPS.
+## Build
 
-CUDA FP32 uses IEEE arithmetic with TF32 disabled; cuBLAS uses pedantic FP32 math. Reduced-precision CUDA reductions are disabled. MPS does not enable `AllowReducedPrecision`. Our Metal shaders use safe math and precise floating-point functions.
+Requirements:
 
-Library TF32 may use IEEE FP32 or [native ties-away TF32 conversion](https://docs.nvidia.com/cuda/archive/11.0_GA/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cvt). Validation accepts those legal alternatives and records the closest reference. Custom WMMA/Triton TF32 use nearest-even only. A reference match is not an instruction trace.
-
-## Setup
-
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/). Python 3.11–3.14 is supported; the commands below select Python 3.12. Exact versions for each saved experiment are recorded in its report metadata.
+- Python 3.11–3.14 and [uv](https://docs.astral.sh/uv/getting-started/installation/).
+- CUDA: Linux, NVIDIA driver, CUDA toolkit with `nvcc` and cuBLAS. PyTorch uses CUDA 12.8 wheels on Linux x86_64.
+- `pipeline`, `wmma`, Triton, TF32 and CUDA BF16: compute capability 8.0+.
+- Metal/NEON: Apple Silicon, macOS 15+, Xcode/Command Line Tools SDK with Metal 4 declarations. TensorOps require macOS 26+.
+- Triton: matching Python development headers (`Python.h`), included with uv-managed Python.
 
 ```sh
 uv sync --frozen --python 3.12
-```
 
-### Apple Silicon Mac
-
-Native CPU/Metal builds require Apple Silicon, macOS 15+ and an Xcode/Command Line Tools SDK exposing the Metal 4 declarations. TensorOps require macOS 26+. Earlier supported macOS versions can use the classic Metal kernels/MPS; unsupported TensorOps cases are recorded with reasons.
-
-```sh
-make                  # Metal + CPU on macOS
-# Or independently:
-make metal
+make                    # Metal + CPU on macOS; CUDA on Linux
+make metal              # Individual builds
 make cpu
-```
-
-Metal shaders compile **at runtime** with `newLibraryWithSource`. No offline `metal` compiler, downloaded Metal Toolchain component, PyObjC or Python Metal binding is required. Shaders are loaded relative to the project, not the current directory. Native code uses Objective-C++/ARC with Foundation, Metal and MetalPerformanceShaders. CPU code uses NEON and Accelerate's modern CBLAS interface.
-
-### CUDA
-
-CUDA builds require Linux, a compatible NVIDIA driver and a toolkit with `nvcc`/cuBLAS. Linux x86_64 PyTorch wheels use the CUDA 12.8 index; macOS uses ordinary PyTorch wheels with MPS support.
-
-```sh
-make cuda
 make cuda CUDA_HOME=/usr/local/cuda-12.8 CUDA_ARCH=sm_86
-# The SIMT kernels also build for older devices with CUDA_ARCH=sm_75.
-```
 
-`CUDA_ARCH=native` is the default. Cross-compilation is supported: compile `sm_86` on another host with a toolkit, then copy `build/matmul.so` to the GPU host. The binary has a toolkit-library rpath; compatible CUDA runtime/cuBLAS libraries must be available there. CUDA ABI **3** is checked before binding functions; rebuild old ABI-2 binaries. New Metal/CPU libraries use ABI 1.
-
-The default builds use `-O3`, not fast-math. `NVCCFLAGS` can expose resource usage:
-
-```sh
-make cuda CUDA_ARCH=sm_86 NVCCFLAGS='-O3 -Xptxas=-v'
-```
-
-Optional packages:
-
-```sh
-uv sync --frozen --python 3.12 --extra triton
+# Optional CUDA backends
 uv sync --frozen --python 3.12 --extra triton --extra jax
 ```
 
-Triton does not need a system-wide CUDA toolkit, but requires an SM80+ device for this implementation. Its launch helpers also need matching Python development headers (`Python.h`): uv-managed Python includes them; distro Python may need `python3-devel` (Fedora) or `python3-dev` (Debian/Ubuntu). A missing package needed by an active requested backend is an error, not a silent replacement with another implementation.
+Libraries are written to `build/`. Builds use `-O3` without fast-math. Metal shaders compile at runtime; the offline Metal compiler is not required. CUDA defaults to `CUDA_ARCH=native`; cross-compiled binaries need compatible CUDA runtime/cuBLAS libraries on the target host.
 
 ## Run
 
-`--platform auto` selects Metal on Apple Silicon, CUDA when available elsewhere, or CPU. An explicitly CPU-only backend list selects CPU without opening a GPU context. Defaults include the platform's own native kernels and installed base-library baselines; optional Triton/JAX are selected explicitly.
-
 ```sh
-# This Mac: all native CPU/Metal variants, MPS and PyTorch baselines.
+# CUDA: custom kernels and libraries
+uv run --frozen --python 3.12 --extra triton --extra jax src/main.py --platform cuda \
+  --backends numpy tiled register warp warp_large pipeline wmma cublas torch triton jax \
+  --precisions fp32 tf32 fp16 bf16 --cpu-threads 8 --output result/my-cuda
+
+# Metal: custom kernels, MPS and CPU baselines
 uv run --frozen --python 3.12 src/main.py --platform metal \
   --precisions fp32 fp16 bf16 --cpu-threads 18 --output result/my-mac
 
-# Ampere-or-newer CUDA: old/new custom kernels plus libraries.
-uv run --frozen --python 3.12 --extra triton src/main.py --platform cuda \
-  --backends numpy tiled register warp warp_large pipeline wmma cublas torch triton \
-  --precisions fp32 tf32 fp16 bf16 --cpu-threads 8 --output result/my-cuda
-
-# Add optional JAX on CUDA; it has resident/end-to-end timing, not CUDA-graph timing.
-uv run --frozen --python 3.12 --extra jax src/main.py --platform cuda \
-  --backends cublas torch jax --precisions fp32 tf32 fp16 bf16
-
-# Native CPU experiments on this Mac; thread pool persists across matrix plans.
+# CPU
 uv run --frozen --python 3.12 src/main.py --platform cpu \
   --backends numpy cpu_neon accelerate torch_cpu --cpu-threads 18 \
   --modes resident end_to_end --output result/my-cpu
 
-# CPU-only libraries: no GPU/native build needed, also on Linux.
-uv run --frozen --python 3.12 src/main.py --backends numpy torch_cpu
-
-# Boundaries, short K, rectangular matrices and partial Morton blocks.
+# Rectangular matrices: M×K×N
 uv run --frozen --python 3.12 src/main.py --platform metal \
   --shapes 31x33x65 511x257x129 513x129x577 --precisions fp32 fp16 bf16
 ```
 
-Defaults: square sizes 64–4096, FP32, 10 warmups, 21 samples, one requested CPU thread. Other controls: `--sizes`, `--shapes MxKxN`, `--modes`, `--seed`, `--device`, `--warmup`, `--repeats`, `--no-plot`. `--library` overrides the CUDA/Metal library, or the CPU library with `--platform cpu`. No valid backend/precision/mode combination is an error; otherwise unsupported combinations are printed and recorded.
+Defaults: square sizes 64–4096, FP32 inputs, 10 warmups, 21 samples, one requested CPU thread. `--platform auto` selects Metal on Apple Silicon, otherwise CUDA if available, otherwise CPU. Optional backends require `--extra triton` / `--extra jax` and explicit selection with `--backends`.
 
-## What is timed
+Use `--sizes`, `--shapes`, `--warmup`, `--repeats`, `--modes`, `--device`, `--seed`, `--library`, `--no-plot` and `--output` to configure a run. Unsupported combinations are recorded with reasons. Full options: `uv run --frozen --python 3.12 src/main.py --help`.
 
-| Measurement | Included |
+## Timing
+
+| Field/mode | Measured work |
 | --- | --- |
-| `backend_initialization_ms` | Reusable context/library initialization; includes runtime Metal library compilation where needed |
-| `setup_ms` | Host-input placement/conversion/packing, output allocation, preparation, first dispatch and completion; includes initial pipeline creation/JIT/autotuning |
-| `device` | CUDA events inside a captured graph, or native Metal command-buffer GPU timestamps; ten GEMMs/batch, normalized per GEMM |
-| `resident` | Synchronized wall time with converted/packed resident inputs and reused output; includes host dispatch |
-| `end_to_end` | Original FP32 host inputs to owned FP32 host output: data allocations, casts, packing, placement/transfers and readback |
+| `backend_initialization_ms` | Reusable context/library initialization |
+| `setup_ms` | Input placement/conversion, output allocation, preparation and first completed call, including JIT/autotuning |
+| `device` | CUDA Graph events or Metal command-buffer GPU timestamps; ten GEMMs/batch, normalized per GEMM |
+| `resident` | Synchronized wall time with resident inputs; includes dispatch |
+| `end_to_end` | FP32 host inputs to owned FP32 host output, including allocation, conversion, packing, copies and readback |
 
-Schema 3 setup **includes input placement/conversion**. Setup is not pure compiler time, and caches may already be warm. Validation/readback used only for correctness, graph capture and the first CUDA graph replay are excluded from steady-state samples.
+- CUDA kernels, PyTorch CUDA, Triton and NumPy reuse resident outputs. JAX allocates its result. CPU backends, JAX and PyTorch MPS have no device-timestamp rows.
+- Metal end-to-end calls allocate fresh shared buffers and copy inputs/results. NEON packs B during setup; end-to-end includes packing again. Worker threads persist across plans.
+- CPU thread limits are requested before numerical imports; vendor-library worker counts are not verified. NEON records `actual_threads` separately.
+- Samples reuse the same seeded inputs. Validation, graph capture and the first graph replay are excluded from steady-state timing. Clocks and desktop activity are not controlled; p10–p90 bands are sample quantiles, not confidence intervals.
 
-- CPU backends and PyTorch MPS have no device-timestamp rows. JAX is not timed with unrelated PyTorch CUDA-stream events.
-- NumPy now has a resident mode using `matmul(..., out=...)`. JAX keeps its normal result-allocation behavior.
-- CUDA native/PyTorch/Triton reuse resident output buffers. Triton end-to-end rebinds its frozen kernel without retuning.
-- Metal contexts cache compute pipelines and shape-specific MPS operations. End-to-end plans allocate fresh shared MTLBuffers, copy/convert directly into them, and return an owned NumPy copy. Unified memory does **not** make this path allocation/copy-free or imply PCIe transfers. PyTorch MPS has its own caching allocator/transport.
-- NEON packs B once per prepared plan; end-to-end includes packing and owned-result copying. Persistent workers belong to the context, so plan recreation does not recreate OS threads. One-thread execution runs directly on the caller. `actual_threads` is clamped to available row blocks/hardware. Vendor thread counts are not asserted: their limits are requested before numerical imports.
-- Same seeded FP32 inputs are shared between implementations. Samples reuse data and describe cache-warm execution; clocks/desktop activity are not controlled by the benchmark.
+Throughput: `2*M*K*N / seconds / 1e12` TFLOP/s. Setup can use warm caches; it is not a cold-compilation measurement.
 
-Throughput is `2*M*K*N / seconds / 1e12` TFLOP/s. End-to-end throughput includes transport/API overhead, not just arithmetic.
+## Precision and validation
 
-## Correctness and format error
+FP16/BF16 inputs are rounded before multiplication. CUDA FP32 disables TF32; cuBLAS uses pedantic FP32 math. Reduced-precision CUDA reductions and Metal relaxed precision are disabled.
 
-Each problem has an independent CPU FP64 reference for the original FP32 inputs. Another FP64 reference multiplies precision-rounded inputs. Library TF32 also permits ties-away/IEEE alternatives. All formats use the same component-wise arithmetic allowance:
+Results are checked against independent CPU FP64 products of the original and precision-rounded inputs. Reports separate total, arithmetic and quantization error. Custom WMMA/Triton TF32 uses nearest-even rounding; library TF32 validation also accepts ties-away and IEEE FP32 inputs.
 
-```
-abs(result - reference) <= 5e-4 + 5e-4*abs(reference) + gamma_K*S
-gamma_K = K*u / (1 - K*u), u = 2^-23
+The component-wise arithmetic bound is:
+
+```text
+abs(result - reference) <= atol + rtol*abs(reference) + gamma_K*S
 S = abs(A_rounded) @ abs(B_rounded)
+gamma_K = K*u / (1 - K*u), u = 2^-23, atol = rtol = 5e-4
 ```
 
-Full FP32 epsilon conservatively covers hardware MMA accumulation whose internal rounding is not necessarily nearest-even. TF32 uses an upper envelope of legal rounded inputs for `S`; if `K*u >= 1`, the bound uses `(1+u)^K - 1`. Cancellation can make this bound loose; passing it is not a promise of small relative error on ill-conditioned inputs.
+For `K*u >= 1`, the bound uses `(1+u)^K - 1`; TF32 uses an upper envelope over permitted input roundings. The bound can be loose under cancellation. Implementation: [src/precision.py](src/precision.py). Invalid shapes, nonfinite values, overflow and failed numerical checks abort the run.
 
-Reports separate total `relative_frobenius_error`/`max_abs_error` against the original inputs, arithmetic error against the selected reference, quantization error, `max_tolerance_ratio` and `roundoff_bound_max`. `arithmetic_reference` identifies RNE, ties-away or the permitted library IEEE path. Zero-reference relative error is zero for an exact result, otherwise `null`. Wrong shapes, non-FP32/nonfinite outputs, format overflow or failed checks abort. End-to-end paths are checked too; asynchronous GPU errors surface at synchronization.
+## Results
 
-## Saved experiments and findings
-
-| Directory | Hardware/coverage |
+| Directory | Measurements |
 | --- | --- |
-| [`result/mac-m5-max/kernels`](result/mac-m5-max/kernels/) | Apple M5 Max, 40 GPU cores, 48 GB unified memory; 260 rows, sizes 64–4096, 18 requested CPU threads, FP32/FP16/BF16 |
-| [`result/mac-m5-max/cpu-1`](result/mac-m5-max/cpu-1/) | Same Mac, one requested CPU thread, sizes 64–2048 |
-| [`result/mac-m5-max/tails`](result/mac-m5-max/tails/) | Same Mac, rectangular/tail problems including partial Morton blocks |
-| [`result/tensorpc/custom`](result/tensorpc/custom/) | RTX 3070 Ti/SM86; 350 rows, sizes 64–4096, custom SIMT/`cp.async`/WMMA, cuBLAS, PyTorch, Triton, JAX and CPU baseline; all four precisions |
+| [RTX 3070 Ti](result/tensorpc/custom/) | 350 rows; sizes 64–4096; FP32, TF32, FP16, BF16 |
+| [M5 Max](result/mac-m5-max/kernels/) | 260 rows; sizes 64–4096; FP32, FP16, BF16; 18 requested CPU threads |
+| [M5 Max CPU, one worker](result/mac-m5-max/cpu-1/) | 32 rows; sizes 64–2048 |
+| [M5 Max rectangular matrices](result/mac-m5-max/tails/) | 156 rows; partial tiles and Morton blocks |
 
-The current analysis uses the RTX 3070 Ti for CUDA and the M5 Max for Metal/CPU. The older [GTX 1660 run](result/homepc/custom/) is retained only as a legacy record and is excluded from the findings below.
+Each directory contains JSON, CSV and plots for the measured modes. JSON schema 3 includes environment, raw samples, errors, selected kernel configurations and native-library hashes. CUDA build/test details: [custom-build.json](result/tensorpc/custom-build.json). [GTX 1660 results](result/homepc/custom/) are retained separately and excluded from this analysis.
 
-The Mac run used three warmups/nine samples. Observed 4096² device medians:
+The tables use FP32 inputs/output and synchronized wall time, in milliseconds: `resident` reuses prepared inputs; `end_to_end` includes host-input preparation and result readback. Each case has three warmups and nine samples. GPU-only timings are shown separately. Results from different machines are not directly comparable.
 
-| M5 Max backend | FP32 ms | FP16 ms | BF16 ms |
-| --- | ---: | ---: | ---: |
-| `metal_naive` | 160.53 | 158.28 | — |
-| `metal_tiled` | 33.01 | 32.65 | — |
-| `metal_simd` | 146.95 | 15.81 | — |
-| `metal_tensor` | 8.95 | 2.59 | 2.33 |
-| `metal_tensor_morton` | 9.28 | 2.52 | 2.43 |
-| `mps` | 9.70 | 2.44 | — |
+### RTX 3070 Ti
 
-These are one machine/run, not peak specifications. TensorOps make our shader competitive with MPS here. Shared-memory/SIMD-group complexity alone did not guarantee an improvement, and Morton order was not a universal win. GPU time is not full application latency: `metal_tensor` FP32 end-to-end was 24.29 ms while `torch_mps` was 11.99 ms in this run.
+4096×4096; eight requested CPU threads. NumPy runs on CPU, `torch` is PyTorch CUDA. PyTorch CPU was not measured in this run.
 
-The Mac NEON implementation also scales across its persistent workers. For 2048² resident calls:
+| Backend | Device | Resident ms | End-to-end ms |
+| --- | --- | ---: | ---: |
+| `numpy` | CPU | 133.944 | 135.071 |
+| `tiled` | CUDA | 66.155 | 104.202 |
+| `register` | CUDA | 21.383 | 60.882 |
+| `warp` | CUDA | 13.741 | 50.853 |
+| `warp_large` | CUDA | 12.335 | 51.391 |
+| `pipeline` | CUDA | 12.295 | 49.490 |
+| `cublas` | CUDA | 10.659 | 49.450 |
+| `torch` | CUDA | 10.597 | 46.493 |
+| `triton` | CUDA | 15.362 | 53.458 |
+| `jax` | CUDA | 8.546 | 56.617 |
 
-| Requested CPU threads | Actual NEON workers | Median ms |
-| ---: | ---: | ---: |
-| 1 | 1 | 231.47 |
-| 18 | 16 | 17.73 |
+**Resident latency.** NumPy appears in the FP32 panel; GPU backends also have reduced-precision measurements.
 
-The 16-row-block limit explains why the second case uses fewer workers than requested. Accelerate/NumPy remain substantially faster CPU baselines; this is not a claim that our NEON implementation beats vendor BLAS.
+![RTX 3070 Ti resident latency: NumPy CPU, PyTorch CUDA, JAX, cuBLAS, Triton and custom kernels](result/tensorpc/custom/resident.png)
 
-**RTX 3070 Ti verification is complete.** All nine native CUDA tests, eight precision tests and five Triton tests passed, including masked/unaligned inputs, TF32 halfway rounding and CUDA Graph capture. The new run contains 350 validated measurement rows, with three warmups/nine samples and FP32 outputs. Source/binary hashes, compiler resources and execution evidence are recorded in [`result/tensorpc/custom-build.json`](result/tensorpc/custom-build.json).
+**End-to-end latency.** FP32 host arrays to FP32 host result.
 
-Observed 4096² CUDA-device medians (ms; setup/transfers excluded):
+![RTX 3070 Ti end-to-end latency including NumPy and PyTorch](result/tensorpc/custom/end_to_end.png)
 
-| Implementation | FP32 | TF32 | FP16 | BF16 |
-| --- | ---: | ---: | ---: | ---: |
-| `tiled` | 66.145 | — | — | — |
-| `register` | 21.360 | — | — | — |
-| `warp` | 13.708 | — | — | — |
-| `warp_large` | 12.310 | — | — | — |
-| `pipeline` (`cp.async`) | 12.276 | — | — | — |
-| `wmma` | — | 17.643 | 13.985 | 10.687 |
-| cuBLAS | 10.518 | 3.402 | 1.764 | 1.736 |
-| PyTorch | 10.466 | 3.402 | 1.764 | 1.732 |
-| Triton | 15.430 | 5.101 | 3.384 | 3.367 |
+<details>
+<summary>GPU-only timing by input precision</summary>
 
-`pipeline` is 5.39× faster than `tiled` and 1.74× faster than `register` at this size, but only 0.28% ahead of `warp_large`: this run does not establish a meaningful `cp.async` win. It remains 16.7% slower than cuBLAS FP32. The first custom WMMA kernel is correct but 5.2–7.9× slower than cuBLAS in its matching precision; Tensor Core instructions alone did not produce a competitive implementation.
+NumPy is excluded because it runs on CPU. JAX has no device-timestamp measurements.
 
-JAX is included in the resident/end-to-end reports, not this device-only table: it has no device timestamp timing here. Cross-machine timings are not an architectural ranking.
+![RTX 3070 Ti GPU-only timing: custom CUDA kernels, cuBLAS, PyTorch and Triton](result/tensorpc/custom/runtime.png)
 
-## What these experiments teach
+</details>
 
-The goal is an optimization lab, not a universal replacement for vendor GEMM. The four current reports contain 798 measurement rows; superseded runs have been removed, apart from the separately identified legacy GTX record. Baseline kernels remain deliberately: comparing successive implementations is the experiment.
+### Apple M5 Max
 
-- **Reuse and layout come first.** Shared/register tiling and warp-aware work distribution make the custom CUDA kernels substantially faster than the original baseline. Writing lower-level instructions is useful when it addresses a measured bottleneck, not by itself.
-- **Tuning depends on the workload.** The larger SIMT tile improves the large RTX 3070 Ti case, but asynchronous copies do not establish a meaningful extra win there. Morton traversal on the Mac is not a universal improvement either.
-- **Matrix instructions are not a complete GEMM implementation.** Our Metal TensorOps shader is competitive with MPS on the measured large squares; our first CUDA WMMA kernel is not competitive with cuBLAS. Neither API choice guarantees good memory access, scheduling or resource usage.
-- **Precision changes the problem.** FP16/BF16 inputs with FP32 output accelerate cuBLAS on the RTX 3070 Ti, but choosing those formats does not make our first WMMA kernel competitive. Input quantization and arithmetic error must be reported separately; these random-input results do not establish accuracy for every application.
-- **Kernel time is not application time.** Packing, conversion, allocation, dispatch and readback can reverse a device-only comparison. Unified memory does not remove explicit copies in our wrapper. Library baselines remain essential; a many-worker NEON speedup does not establish a win over Accelerate.
-- **Abstraction level is a separate axis.** Native CUDA, Triton and the PyTorch/JAX frontends expose different amounts of control and setup cost. Framework names alone do not identify the instructions or library algorithm that ran.
-- **Negative results are useful evidence.** Keep the slow but correct variants. For the next WMMA iteration, profile memory access, register usage, occupancy and matrix-unit utilization before choosing a change. Current timings do not diagnose the cause of its performance gap.
+4096×4096; 40 GPU cores, 48 GB unified memory, 18 requested CPU threads. `torch_cpu` is PyTorch CPU; `torch_mps` is PyTorch on the Metal GPU.
 
-Performance conclusions apply to the saved shapes, precisions and cache-warm runs. Desktop activity and clocks were not controlled; small timing differences are not established improvements.
+| Backend | Device | Resident ms | End-to-end ms |
+| --- | --- | ---: | ---: |
+| `numpy` | CPU | 53.140 | 57.432 |
+| `accelerate` | CPU | 53.307 | 55.780 |
+| `cpu_neon` | CPU | 157.369 | 179.734 |
+| `torch_cpu` | CPU | 79.250 | 79.482 |
+| `metal_naive` | Metal | 161.247 | 176.915 |
+| `metal_tiled` | Metal | 33.648 | 45.426 |
+| `metal_simd` | Metal | 146.670 | 163.231 |
+| `metal_tensor` | Metal | 9.079 | 24.291 |
+| `metal_tensor_morton` | Metal | 9.425 | 24.625 |
+| `mps` | Metal | 10.072 | 24.853 |
+| `torch_mps` | Metal | 9.406 | 11.989 |
 
+**Resident latency.** The FP32 panel compares NumPy, Accelerate, PyTorch CPU/MPS, NEON and Metal kernels.
 
-## Reports, native APIs and checks
+![M5 Max resident latency: NumPy, Accelerate, PyTorch CPU and MPS, NEON and Metal kernels](result/mac-m5-max/kernels/resident.png)
 
-Each measured directory contains `results.json`, `results.csv`, and plots for the modes actually measured: `runtime.png` (device), `resident.png`, `end_to_end.png`. JSON schema **3** records raw samples, environment, execution device, unsupported cases and generic `kernel_config`. Configurations come from native geometry constants/Triton's selected plan; library internals are not guessed. Native binaries are hashed, and Metal's runtime shader source is identified separately. Shaded p10–p90 bands are not confidence intervals. Generated files in the chosen output directory are overwritten on subsequent runs.
+**End-to-end latency.** Includes allocation, conversion and copies in each backend's host-to-host path.
 
-`NativeMatmul.prepare(name, a, b, out, precision=...)` validates CUDA tensors and returns an asynchronous operation bound to the current stream. Closures retain storage, output cannot overlap inputs, and the C library allocates/copies no matrix buffers. `configuration(name, precision)` returns the actual native geometry. Serialize a context across streams and synchronize before closing it.
+![M5 Max end-to-end latency including NumPy and both PyTorch backends](result/mac-m5-max/kernels/end_to_end.png)
 
-`MetalMatmul.prepare(name, a, b, precision)` accepts original contiguous FP32 NumPy inputs. A plan exposes `run()`, `synchronize()`, owned `numpy()`, `config`, `device_samples()` and `close()`; plans retain their Metal resources independently of the creating context. `CpuMatmul(..., threads=N)` has the same prepared run/readback interface without GPU timing. CPU inputs must remain unchanged while prepared; closing a CPU context closes its plans/workers. `triton_matmul.prepare(...)` keeps its `run`, `out`, `config` and frozen `bind` interface.
+<details>
+<summary>GPU-only timing by input precision</summary>
 
-Triton autotuning varies tiles, warps and stages, with shape/precision/device-specific keys. Tensor modes include 128×128/128×256 candidates. Selected configurations are copied to independent plans and bypass the autotuner during resident launches/rebinding/capture. A new process may retune; setup records observed cost, not an assumed cold compilation time.
+CPU backends and PyTorch MPS have no device-timestamp measurements.
+
+![M5 Max GPU-only timing: custom Metal kernels and MPS](result/mac-m5-max/kernels/runtime.png)
+
+</details>
+
+### CPU libraries and NEON on M5 Max
+
+2048×2048, FP32, resident wall time. The columns specify requested thread limits, not verified vendor-library worker counts. NEON uses one and 16 workers respectively, limited by the 128-row blocks.
+
+| Backend | 1 requested thread, ms | 18 requested threads, ms |
+| --- | ---: | ---: |
+| `numpy` | 9.019 | 6.357 |
+| `accelerate` | 9.076 | 6.326 |
+| `torch_cpu` | 9.009 | 9.218 |
+| `cpu_neon` | 231.469 | 17.734 |
+
+**CPU size sweep with one requested thread.** Overlapping NumPy, Accelerate and PyTorch curves are separate measurements.
+
+![M5 Max CPU resident latency: NumPy, Accelerate, PyTorch and NEON with one requested thread](result/mac-m5-max/cpu-1/resident.png)
+
+## Tests
+
+Build the native libraries for the target machine, then run:
 
 ```sh
-# After the native build appropriate for the machine:
 uv run --frozen --python 3.12 python -m unittest discover -s tests -v
 ```
 
-Regression checks cover independent numerical results, rounded-input ties/subnormals, tails/long K, malformed/overlapping inputs, prepared-plan lifetimes, persistent-worker concurrency, GPU timestamp validity and CUDA graphs. Hardware-dependent tests skip explicitly when prerequisites are missing; compilation alone does not count as a GPU correctness run.
+Hardware-dependent tests skip when prerequisites are unavailable.
