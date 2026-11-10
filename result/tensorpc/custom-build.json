@@ -1,0 +1,116 @@
+{
+  "recorded_at_utc": "2026-11-10T00:04:39.411423+00:00",
+  "status": "executed_and_verified_on_sm86",
+  "verification": {
+    "recorded_at_utc": "2026-11-10T08:18:28.263964+00:00",
+    "device": "NVIDIA GeForce RTX 3070 Ti",
+    "compute_capability": [8, 6],
+    "native_cuda_tests_passed": 9,
+    "precision_tests_passed": 8,
+    "triton_tests_passed": 5,
+    "tests_skipped": 0,
+    "benchmark": "result/tensorpc/custom/results.json",
+    "measurement_rows": 350,
+    "samples_per_row": 9,
+    "maximum_tolerance_ratio": 0.006385522550890922,
+    "python": "3.14.7",
+    "python_headers": {
+      "package": "python3-devel-3.14.7-1.fc43.x86_64",
+      "source": "https://kojipkgs.fedoraproject.org/packages/python3.14/3.14.7/1.fc43/x86_64/python3-devel-3.14.7-1.fc43.x86_64.rpm",
+      "sha256": "49e47a2089f1712f645c766c2de2d5f7fc3981d189c8c318bef24df080ce9dfa",
+      "cpath": "/home/guest/matrix-multiplication/.tools/python-devel-root/usr/include/python3.14",
+      "installation": "Extracted locally; system Python and packages unchanged"
+    },
+    "benchmark_command": "CPATH=/home/guest/matrix-multiplication/.tools/python-devel-root/usr/include/python3.14 /home/guest/matrix-multiplication/.venv/bin/python /home/guest/matrix-multiplication/src/main.py --platform cuda --backends numpy tiled register warp warp_large pipeline wmma cublas torch triton jax --sizes 64 256 1024 2048 4096 --precisions fp32 tf32 fp16 bf16 --cpu-threads 8 --warmup 3 --repeats 9 --no-plot --output /home/guest/matrix-multiplication/result/tensorpc/custom"
+  },
+  "abi": 3,
+  "toolkit": "/usr/local/cuda-12.8",
+  "target": "sm_86",
+  "nvcc_flags": [
+    "-O3",
+    "-Xptxas=-v",
+    "-arch=sm_86",
+    "-shared",
+    "-Xcompiler=-fPIC",
+    "-lcublas"
+  ],
+  "library_sha256": "c03d11d9df2b85a90621355826e1e9df8eccc53b0e59d85a7cc088144039088b",
+  "source_sha256": {
+    "src/matmul.cu": "95f1252bbcbcd49a22d971de257016966ba651cc15c871b0dec8b1ac6b4e9691",
+    "src/matmul_custom.cuh": "6bdff2f739e147bc04a23c9ebf1cfed75b20268911c9673787ceb2686817843a"
+  },
+  "kernel_resources": [
+    {
+      "backend": "tiled",
+      "precision": "fp32",
+      "registers": 40,
+      "shared_bytes": 12288,
+      "stack_bytes": 0,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0
+    },
+    {
+      "backend": "register",
+      "precision": "fp32",
+      "registers": 64,
+      "shared_bytes": 8192,
+      "stack_bytes": 0,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0
+    },
+    {
+      "backend": "warp",
+      "precision": "fp32",
+      "registers": 80,
+      "shared_bytes": 13312,
+      "stack_bytes": 0,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0
+    },
+    {
+      "backend": "warp_large",
+      "precision": "fp32",
+      "registers": 128,
+      "shared_bytes": 34816,
+      "stack_bytes": 0,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0
+    },
+    {
+      "backend": "pipeline",
+      "precision": "fp32",
+      "registers": 167,
+      "shared_bytes": 36864,
+      "stack_bytes": 0,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0
+    },
+    {
+      "backend": "wmma",
+      "precision": "tf32",
+      "registers": 166,
+      "shared_bytes": 16384,
+      "stack_bytes": 0,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0
+    },
+    {
+      "backend": "wmma",
+      "precision": "fp16",
+      "registers": 141,
+      "shared_bytes": 16384,
+      "stack_bytes": 0,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0
+    },
+    {
+      "backend": "wmma",
+      "precision": "bf16",
+      "registers": 128,
+      "shared_bytes": 16384,
+      "stack_bytes": 0,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0
+    }
+  ]
+}

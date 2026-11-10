@@ -1,4 +1,4 @@
-.venv
-uv.lock
-__pycache__
-*so
+.venv/
+__pycache__/
+build/
+*.so

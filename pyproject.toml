@@ -1,12 +1,25 @@
 [project]
 name = "matmul"
 version = "0.1.0"
-description = "Add your description here"
+description = "Custom CUDA, Apple Metal and ARM NEON GEMM benchmarks with explicit precision"
 readme = "README.md"
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.11,<3.15"
 dependencies = [
-    "jax[cuda12]==0.7.2",
+    "numpy>=2.0",
     "matplotlib>=3.10.6",
-    "mplcyberpunk>=0.7.6",
-    "torch>=2.8.0",
+    "torch>=2.11,<3",
+]
+
+[project.optional-dependencies]
+jax = ["jax[cuda12]>=0.7.2; sys_platform == 'linux'"]
+triton = ["triton>=3.6,<4; sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]
